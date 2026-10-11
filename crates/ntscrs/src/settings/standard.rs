@@ -158,6 +158,18 @@ impl Default for VHSSettings {
     }
 }
 
+/// The color television standard whose composite signal is emulated.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
+pub enum VideoStandard {
+    /// NTSC: YIQ, 3.58 MHz subcarrier, its phase inverted on every line.
+    Ntsc,
+    /// PAL: YUV, 4.43 MHz subcarrier, the V component's phase switched on every other line, decoded with the PAL delay
+    /// line, which turns hue errors into saturation errors.
+    Pal,
+}
+impl SettingsEnum for VideoStandard {}
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
 pub enum ChromaLowpass {
@@ -344,12 +356,16 @@ pub mod setting_id {
     pub const VERTICAL_SCALE: NtscSettingID = setting_id!(59, "vertical_scale", scale.settings.vertical_scale);
     pub const SCALE_WITH_VIDEO_SIZE: NtscSettingID = setting_id!(60, "scale_with_video_size", scale.settings.scale_with_video_size);
     pub const SCALE_SETTINGS: NtscSettingID = setting_id!(61, "scale_settings", scale.enabled);
+    pub const VIDEO_STANDARD: NtscSettingID = setting_id!(62, "video_standard", video_standard);
+    pub const PAL_DELAY_LINE: NtscSettingID = setting_id!(63, "pal_delay_line", pal_delay_line);
 }
 
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct NtscEffect {
     pub random_seed: i32,
+    pub video_standard: VideoStandard,
+    pub pal_delay_line: bool,
     pub use_field: UseField,
     pub filter_type: FilterType,
     pub input_luma_filter: LumaLowpass,
@@ -379,6 +395,8 @@ impl Default for NtscEffect {
     fn default() -> Self {
         Self {
             random_seed: 0,
+            video_standard: VideoStandard::Ntsc,
+            pal_delay_line: true,
             use_field: UseField::InterleavedUpper,
             filter_type: FilterType::Butterworth,
             input_luma_filter: LumaLowpass::Notch,
@@ -428,6 +446,44 @@ impl Settings for NtscEffect {
                     range: i32::MIN..=i32::MAX,
                 },
                 id: setting_id::RANDOM_SEED,
+            },
+            SettingDescriptor {
+                label: "Video standard",
+                description: Some(
+                    "The color television standard whose composite signal is emulated.",
+                ),
+                kind: SettingKind::Enumeration {
+                    options: vec![
+                        MenuItem {
+                            label: "NTSC",
+                            description: Some(
+                                "YIQ color on a 3.58 MHz subcarrier whose phase flips on every \
+                                 line: hue errors show up as hue shifts.",
+                            ),
+                            index: VideoStandard::Ntsc as u32,
+                        },
+                        MenuItem {
+                            label: "PAL",
+                            description: Some(
+                                "YUV color on a 4.43 MHz subcarrier with the V phase switched on \
+                                 every other line: hue errors cancel out and become saturation \
+                                 errors instead.",
+                            ),
+                            index: VideoStandard::Pal as u32,
+                        },
+                    ],
+                },
+                id: setting_id::VIDEO_STANDARD,
+            },
+            SettingDescriptor {
+                label: "PAL delay line",
+                description: Some(
+                    "PAL only. Average the color of each line with the previous one, as most PAL \
+                     decoders do: hue errors turn into desaturation. Turn off for a simple decoder \
+                     (PAL-S) that shows them as Hanover bars.",
+                ),
+                kind: SettingKind::Boolean,
+                id: setting_id::PAL_DELAY_LINE,
             },
             SettingDescriptor {
                 label: "Use field",

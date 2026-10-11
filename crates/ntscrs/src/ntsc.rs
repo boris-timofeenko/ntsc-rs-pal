@@ -25,6 +25,14 @@ use crate::{
 // TODO: why do we multiply by 4? composite-video-simulator does this for every filter and ntscqt defines NTSC_RATE the
 // same way as we do here.
 const NTSC_RATE: f32 = (315000000.00 / 88.0) * 4.0;
+/// PAL's 4.43361875 MHz subcarrier * 4: one pixel is still a quarter of a subcarrier cycle, so all the modulation code
+/// is shared and only the filters' idea of a megahertz changes.
+const PAL_RATE: f32 = 4433618.75 * 4.0;
+
+/// YIQ is YUV rotated by 33 degrees. PAL works on the U and V axes (the V-switch flips exactly V), so in PAL mode the
+/// I and Q planes are rotated into U and V for the duration of the effect.
+const SIN_33: f32 = 0.544_639;
+const COS_33: f32 = 0.838_671;
 
 /// Create a simple constant-k lowpass filter with the given frequency cutoff, which can then be used to filter a signal.
 fn make_lowpass(cutoff: f32, rate: f32) -> TransferFunction {
@@ -133,6 +141,10 @@ struct EffectCtx {
     horizontal_scale: f32,
     /// The "vertical scale" setting.
     vertical_scale: f32,
+    /// PAL instead of NTSC.
+    pal: bool,
+    /// Four times the color subcarrier frequency of the standard (the effect's sample rate at a bandwidth scale of 1).
+    rate: f32,
 }
 
 struct FixedQueue<T, const N: usize> {
@@ -166,9 +178,10 @@ impl EffectCtx {
         frame_num: usize,
         scale_factor: [f32; 2],
     ) -> Self {
+        let pal = settings.video_standard == VideoStandard::Pal;
         let video_size_scale_factor =
             if settings.scale.enabled && settings.scale.settings.scale_with_video_size {
-                height as f32 / 480.0
+                height as f32 / if pal { 576.0 } else { 480.0 }
             } else {
                 1.0
             };
@@ -191,6 +204,8 @@ impl EffectCtx {
                     .as_option()
                     .map(|scale| scale.vertical_scale)
                     .unwrap_or(1.0),
+            pal,
+            rate: if pal { PAL_RATE } else { NTSC_RATE },
         }
     }
 
@@ -304,11 +319,15 @@ impl EffectCtx {
     /// Apply a lowpass filter to the input chroma, emulating broadcast NTSC's bandwidth cutoffs.
     /// (Well, almost--Wikipedia (https://en.wikipedia.org/wiki/YIQ) puts the Q bandwidth at 0.4 MHz, not 0.6. Although
     /// that statement seems unsourced and I can't find any info on it...)
+    /// In PAL, U and V both get 1.3 MHz.
     fn composite_chroma_lowpass(&self, frame: &mut YiqView, filter_type: FilterType) {
         let i_filter =
-            make_lowpass_for_type(1300000.0, NTSC_RATE * self.horizontal_scale, filter_type);
-        let q_filter =
-            make_lowpass_for_type(600000.0, NTSC_RATE * self.horizontal_scale, filter_type);
+            make_lowpass_for_type(1300000.0, self.rate * self.horizontal_scale, filter_type);
+        let q_filter = make_lowpass_for_type(
+            if self.pal { 1300000.0 } else { 600000.0 },
+            self.rate * self.horizontal_scale,
+            filter_type,
+        );
 
         let width = frame.dimensions.0;
 
@@ -321,7 +340,7 @@ impl EffectCtx {
     /// Apply a less intense lowpass filter to the input chroma.
     fn composite_chroma_lowpass_lite(&self, frame: &mut YiqView, filter_type: FilterType) {
         let filter =
-            make_lowpass_for_type(2600000.0, NTSC_RATE * self.horizontal_scale, filter_type);
+            make_lowpass_for_type(2600000.0, self.rate * self.horizontal_scale, filter_type);
 
         let width = frame.dimensions.0;
 
@@ -331,9 +350,62 @@ impl EffectCtx {
         );
     }
 
-    /// Calculate the chroma subcarrier phase for a given row/field.
+    /// Calculate the chroma subcarrier phase for a given row/field, in quarter cycles. NTSC: 227.5 cycles per line, so
+    /// the phase flips on every line. PAL: 283.75 cycles per line, so it advances by three quarters per line (and per
+    /// field, approximating PAL's 8-field sequence).
     fn chroma_phase_shift(&self, line_index: usize) -> usize {
-        (self.frame_num + (line_index << 1)) & 2
+        if self.pal {
+            (3 * (self.frame_num + line_index)) & 3
+        } else {
+            (self.frame_num + (line_index << 1)) & 2
+        }
+    }
+
+    /// The PAL V-switch: the sign of the V component's carrier on a given row (always 1 for NTSC).
+    fn v_switch(&self, line_index: usize) -> f32 {
+        if self.pal && (self.frame_num + line_index) & 1 == 1 {
+            -1.0
+        } else {
+            1.0
+        }
+    }
+
+    /// How many rows apart the chroma carrier is inverted (for both chroma components): the comb filters' spacing.
+    fn comb_step(&self) -> usize {
+        if self.pal { 2 } else { 1 }
+    }
+
+    /// Rotate the I and Q planes into U and V, or back--the transform is its own inverse.
+    fn swap_iq_uv(&self, yiq: &mut YiqView) {
+        let width = yiq.dimensions.0;
+        ZipChunks::new([yiq.i, yiq.q], width).par_for_each(|_, [i, q]| {
+            for (i, q) in i.iter_mut().zip(q.iter_mut()) {
+                let (a, b) = (*i, *q);
+                *i = b * COS_33 - a * SIN_33;
+                *q = a * COS_33 + b * SIN_33;
+            }
+        });
+    }
+
+    /// The PAL delay line: average the chroma of each row with the previous row of the field. A phase error rotates the
+    /// hue one way on a line and the other way on the next (the V-switch), so the average keeps the hue and loses some
+    /// saturation instead.
+    fn pal_delay_line(&self, yiq: &mut YiqView) {
+        let width = yiq.dimensions.0;
+        let rows = yiq.num_rows();
+        if rows < 2 {
+            return;
+        }
+        for plane in [&mut *yiq.i, &mut *yiq.q] {
+            // Bottom up, so every row is averaged with the unmodified row above it.
+            for row in (1..rows).rev() {
+                let (above, below) = plane.split_at_mut(row * width);
+                let prev = &above[(row - 1) * width..];
+                for (cur, prev) in below[..width].iter_mut().zip(prev) {
+                    *cur = (*cur + *prev) * 0.5;
+                }
+            }
+        }
     }
 
     /// Modulate the chrominance signal (I and Q planes) into the Y (luminance) plane.
@@ -361,8 +433,9 @@ impl EffectCtx {
                         })
                     };
 
+                    let sw = self.v_switch(index);
                     let i_mult = offset_wave(xi);
-                    let q_mult = offset_wave(xi + 3);
+                    let q_mult = offset_wave(xi + 3) * sw;
                     let mut y_chunks = y.chunks_exact_mut(S::f32s::N);
                     let mut i_chunks = i.chunks_exact(S::f32s::N);
                     let mut q_chunks = q.chunks_exact(S::f32s::N);
@@ -385,7 +458,7 @@ impl EffectCtx {
                         .enumerate()
                     {
                         let phase = (index + xi) & 3;
-                        *y += i * I_MULT[phase] + q * Q_MULT[phase];
+                        *y += i * I_MULT[phase] + q * Q_MULT[phase] * sw;
                     }
                 },
             )
@@ -419,12 +492,14 @@ impl EffectCtx {
             })
         };
         let xi = self.chroma_phase_shift(line_index);
+        // Undo the PAL V-switch (no-op for NTSC)
+        let sw = self.v_switch(line_index);
         let i_mult_inv_l = offset_wave(xi) * 0.5;
         let i_mult_inv_c = offset_wave(1 + xi);
         let i_mult_inv_r = offset_wave(2 + xi) * 0.5;
-        let q_mult_inv_l = offset_wave(3 + xi) * 0.5;
-        let q_mult_inv_c = offset_wave(4 + xi);
-        let q_mult_inv_r = offset_wave(5 + xi) * 0.5;
+        let q_mult_inv_l = offset_wave(3 + xi) * (0.5 * sw);
+        let q_mult_inv_c = offset_wave(4 + xi) * sw;
+        let q_mult_inv_r = offset_wave(5 + xi) * (0.5 * sw);
 
         let mut index = 1;
         while index < width.saturating_sub(S::f32s::N) {
@@ -476,7 +551,7 @@ impl EffectCtx {
                 q_modulated += chroma_l * Q_MULT_INV[offset_l] * 0.5;
             }
             i[index] = i_modulated;
-            q[index] = q_modulated;
+            q[index] = q_modulated * sw;
         }
     }
 
@@ -505,20 +580,23 @@ impl EffectCtx {
         dispatch!(self.level, simd => self.demodulate_chroma_line(simd, y, i, q, modulated, line_index));
     }
 
-    /// Demodulate the chroma with a 1-line comb filter.
+    /// Demodulate the chroma with a 1-line comb filter. (In PAL, the line whose carrier is inverted is two rows up, not
+    /// one: the carrier advances by three quarters of a cycle per line and V is switched on every other line.)
     fn luma_into_chroma_comb1(&self, yiq: &mut YiqView) {
         let width = yiq.dimensions.0;
+        let step = self.comb_step();
         let modulated = &mut yiq.scratch;
         // Demodulate the Y (luma) by averaging successive lines of the modulated signal
         ZipChunks::new([yiq.y, yiq.i, yiq.q], width).par_for_each(|line_index, [y, i, q]| {
             // "Reflect" line 2 to line 0, so that the chroma is properly demodulated for line 0.
             // A comb filter requires the phase of the chroma carrier to alternate per line, so simply repeating line 1
             // wouldn't work.
-            let top_line = if line_index == 0 {
-                &modulated[width..width * 2]
+            let top_index = if line_index < step {
+                line_index + step
             } else {
-                &modulated[(line_index - 1) * width..line_index * width]
+                line_index - step
             };
+            let top_line = &modulated[top_index * width..(top_index + 1) * width];
             let bottom_line = &modulated[line_index * width..(line_index + 1) * width];
             // Average the two lines
             for (y, (&top, &bottom)) in y.iter_mut().zip(top_line.iter().zip(bottom_line)) {
@@ -534,18 +612,23 @@ impl EffectCtx {
     fn luma_into_chroma_comb2(&self, yiq: &mut YiqView) {
         let width = yiq.dimensions.0;
         let height = yiq.num_rows();
+        let step = self.comb_step();
         let modulated = &mut *yiq.scratch;
         ZipChunks::new([yiq.y, yiq.i, yiq.q], width).par_for_each(|line_index, [y, i, q]| {
             // For the first line, both prev_line and next_line point to the second line. This effectively makes
             // it a one-line comb filter for that line. See the comment above in the one-line comb filter for
             // why we do this.
-            let prev_index = if line_index == 0 { 1 } else { line_index - 1 };
+            let prev_index = if line_index < step {
+                line_index + step
+            } else {
+                line_index - step
+            };
 
             // Similar for the last line.
-            let next_index = if line_index == height - 1 {
-                height - 2
+            let next_index = if line_index + step >= height {
+                line_index - step
             } else {
-                line_index + 1
+                line_index + step
             };
 
             let prev_line = &modulated[prev_index * width..(prev_index + 1) * width];
@@ -809,9 +892,19 @@ impl EffectCtx {
     fn luma_into_chroma(&self, yiq: &mut YiqView, mut filter_mode: ChromaDemodulationFilter) {
         let width = yiq.dimensions.0;
 
-        // The comb filters only work if we have at least 2 rows, and the 2D filters require at least 2 rows and 3
-        // columns.
-        if (yiq.num_rows() == 1
+        // The 2D filters are built around NTSC's line-alternating carrier; PAL gets its own comb filter instead.
+        if self.pal
+            && matches!(
+                filter_mode,
+                ChromaDemodulationFilter::TwoD | ChromaDemodulationFilter::TwoDAdaptive
+            )
+        {
+            filter_mode = ChromaDemodulationFilter::TwoLineComb;
+        }
+
+        // The comb filters need a partner row on one side of every row: at least 2 rows (4 for PAL). The 2D filters
+        // require at least 2 rows and 3 columns.
+        if (yiq.num_rows() < 2 * self.comb_step()
             && matches!(
                 filter_mode,
                 ChromaDemodulationFilter::OneLineComb
@@ -967,8 +1060,10 @@ impl EffectCtx {
     fn chroma_phase_error(&self, yiq: &mut YiqView, intensity: f32) {
         let width = yiq.dimensions.0;
 
-        ZipChunks::new([yiq.i, yiq.q], width).par_for_each(|_, [i, q]| {
-            Self::chroma_phase_offset_line(i, q, intensity);
+        // After the PAL decoder undoes the V-switch, a carrier phase error rotates the hue in opposite directions on
+        // alternate lines.
+        ZipChunks::new([yiq.i, yiq.q], width).par_for_each(|index, [i, q]| {
+            Self::chroma_phase_offset_line(i, q, intensity * self.v_switch(index));
         });
     }
 
@@ -985,7 +1080,7 @@ impl EffectCtx {
             let phase_shift =
                 (rng.clone().mix(index as u64).random::<f32>() - 0.5) * 2.0 * intensity;
 
-            Self::chroma_phase_offset_line(i, q, phase_shift);
+            Self::chroma_phase_offset_line(i, q, phase_shift * self.v_switch(index));
         });
     }
 
@@ -1418,6 +1513,10 @@ impl NtscEffect {
 
         let ctx = EffectCtx::new(ctx, self, yiq.dimensions.1, frame_num, scale_factor);
 
+        if ctx.pal {
+            ctx.swap_iq_uv(yiq);
+        }
+
         ctx.luma_filter(yiq, self.input_luma_filter);
 
         match self.chroma_lowpass_in {
@@ -1433,9 +1532,10 @@ impl NtscEffect {
         dispatch!(ctx.level, simd => ctx.chroma_into_luma(simd, yiq));
 
         if self.composite_sharpening != 0.0 {
+            // Half the subcarrier frequency
             let preemphasis_filter = make_lowpass(
-                (315000000.0 / 88.0 / 2.0) * ctx.horizontal_scale,
-                NTSC_RATE * ctx.horizontal_scale,
+                (ctx.rate / 8.0) * ctx.horizontal_scale,
+                ctx.rate * ctx.horizontal_scale,
             )
             .with_scale(-self.composite_sharpening);
             ctx.filter_plane(yiq.y, width, &preemphasis_filter, InitialCondition::Zero, 0);
@@ -1566,12 +1666,12 @@ impl NtscEffect {
                 // TODO: use a better filter! this effect's output looks way more smear-y than real VHS
                 let luma_filter = make_lowpass_for_type(
                     luma_cut,
-                    NTSC_RATE * ctx.horizontal_scale,
+                    ctx.rate * ctx.horizontal_scale,
                     self.filter_type,
                 );
                 let chroma_filter = make_lowpass_for_type(
                     chroma_cut,
-                    NTSC_RATE * ctx.horizontal_scale,
+                    ctx.rate * ctx.horizontal_scale,
                     self.filter_type,
                 );
 
@@ -1602,7 +1702,7 @@ impl NtscEffect {
                 );
 
                 let luma_filter_single =
-                    make_lowpass(luma_cut, NTSC_RATE * ctx.horizontal_scale).with_scale(-1.6);
+                    make_lowpass(luma_cut, ctx.rate * ctx.horizontal_scale).with_scale(-1.6);
                 ctx.filter_plane(yiq.y, width, &luma_filter_single, InitialCondition::Zero, 0);
             }
 
@@ -1621,7 +1721,7 @@ impl NtscEffect {
                 };
                 let luma_sharpen_filter = make_lowpass_for_type(
                     luma_cut * frequency_extra_multiplier * sharpen.frequency,
-                    NTSC_RATE * ctx.horizontal_scale,
+                    ctx.rate * ctx.horizontal_scale,
                     self.filter_type,
                 )
                 .with_scale(-sharpen.intensity * 2.0 * sharpen.frequency);
@@ -1669,6 +1769,14 @@ impl NtscEffect {
             }
             ChromaLowpass::None => {}
         };
+
+        if ctx.pal {
+            // Last, so the hue errors of everything above become saturation errors, as on a PAL set.
+            if self.pal_delay_line {
+                ctx.pal_delay_line(yiq);
+            }
+            ctx.swap_iq_uv(yiq);
+        }
     }
 
     fn apply_effect_to_all_fields(
@@ -1756,6 +1864,140 @@ impl NtscEffect {
             BlitInfo::from_full_frame(dimensions.0, dimensions.1, row_bytes),
             crate::yiq_fielding::DeinterlaceMode::Bob,
             (),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    const W: usize = 64;
+    const H: usize = 32;
+
+    /// The effect with every random and degrading pass off, so only the composite encode/decode remains.
+    #[allow(clippy::field_reassign_with_default)]
+    fn quiet(standard: VideoStandard) -> NtscEffect {
+        let mut effect = NtscEffect::default();
+        effect.video_standard = standard;
+        effect.composite_noise.enabled = false;
+        effect.luma_noise.enabled = false;
+        effect.chroma_noise.enabled = false;
+        effect.snow_intensity = 0.0;
+        effect.chroma_phase_noise_intensity = 0.0;
+        effect
+    }
+
+    /// Run a flat color through the effect and return the I and Q of every row, averaged over the middle columns.
+    fn flat_color_rows(effect: &NtscEffect, yiq_in: [f32; 3]) -> vec::Vec<(f32, f32)> {
+        let field = YiqField::Both;
+        let mut buf = vec![0f32; YiqView::buf_length_for((W, H), field)];
+        let mut yiq = YiqView::from_parts(&mut buf, (W, H), field);
+        yiq.y.fill(yiq_in[0]);
+        yiq.i.fill(yiq_in[1]);
+        yiq.q.fill(yiq_in[2]);
+        effect.apply_effect_to_yiq(crate::ctx::global(), &mut yiq, 0, [1.0, 1.0]);
+        (0..H)
+            .map(|row| {
+                let cols = 16..W - 16;
+                let n = cols.len() as f32;
+                let i: f32 = cols.clone().map(|x| yiq.i[row * W + x]).sum();
+                let q: f32 = cols.map(|x| yiq.q[row * W + x]).sum();
+                (i / n, q / n)
+            })
+            .collect()
+    }
+
+    /// Hue angle and saturation of the middle rows.
+    fn hue_sat(rows: &[(f32, f32)]) -> (f32, f32) {
+        let mid = &rows[8..H - 8];
+        let n = mid.len() as f32;
+        let i = mid.iter().map(|r| r.0).sum::<f32>() / n;
+        let q = mid.iter().map(|r| r.1).sum::<f32>() / n;
+        (q.atan2(i), (i * i + q * q).sqrt())
+    }
+
+    const ORANGE: [f32; 3] = [0.6, 0.25, 0.05];
+
+    fn row_hue(rows: &[(f32, f32)], row: usize) -> f32 {
+        rows[row].1.atan2(rows[row].0)
+    }
+
+    #[test]
+    fn pal_keeps_the_hue() {
+        // Even the composite filters' carrier phase shift, which tints NTSC a little, cancels out in PAL.
+        let input = ORANGE[2].atan2(ORANGE[1]);
+        let (hue, _) = hue_sat(&flat_color_rows(&quiet(VideoStandard::Pal), ORANGE));
+        assert!((hue - input).abs() < 0.03, "hue {hue}, input {input}");
+    }
+
+    #[test]
+    fn phase_error_shifts_the_ntsc_hue_but_desaturates_pal() {
+        let turn = 0.05 * 2.0 * PI; // 18 degrees
+        let mut ntsc = quiet(VideoStandard::Ntsc);
+        let (hue_ntsc_clean, _) = hue_sat(&flat_color_rows(&ntsc, ORANGE));
+        ntsc.chroma_phase_error = 0.05;
+        let (hue_ntsc, _) = hue_sat(&flat_color_rows(&ntsc, ORANGE));
+        assert!(
+            ((hue_ntsc - hue_ntsc_clean).abs() - turn).abs() < 0.03,
+            "NTSC hue moved by {}, expected {turn}",
+            hue_ntsc - hue_ntsc_clean
+        );
+
+        let mut pal = quiet(VideoStandard::Pal);
+        let (_, sat_pal_clean) = hue_sat(&flat_color_rows(&pal, ORANGE));
+        pal.chroma_phase_error = 0.05;
+        let (hue_pal, sat_pal) = hue_sat(&flat_color_rows(&pal, ORANGE));
+        let input = ORANGE[2].atan2(ORANGE[1]);
+        assert!(
+            (hue_pal - input).abs() < 0.03,
+            "PAL hue moved by {}",
+            hue_pal - input
+        );
+        assert!(
+            sat_pal < sat_pal_clean * 0.995,
+            "PAL saturation {sat_pal}, clean {sat_pal_clean}"
+        );
+    }
+
+    #[test]
+    fn comb_filters_handle_tiny_images() {
+        for standard in [VideoStandard::Ntsc, VideoStandard::Pal] {
+            for filter in [
+                ChromaDemodulationFilter::OneLineComb,
+                ChromaDemodulationFilter::TwoLineComb,
+                ChromaDemodulationFilter::TwoD,
+                ChromaDemodulationFilter::TwoDAdaptive,
+            ] {
+                for height in 1..=5 {
+                    let mut effect = quiet(standard);
+                    effect.chroma_demodulation = filter;
+                    let field = YiqField::Both;
+                    let mut buf = vec![0.5f32; YiqView::buf_length_for((8, height), field)];
+                    let mut yiq = YiqView::from_parts(&mut buf, (8, height), field);
+                    effect.apply_effect_to_yiq(crate::ctx::global(), &mut yiq, 0, [1.0, 1.0]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pal_without_delay_line_shows_hanover_bars() {
+        let mut pal = quiet(VideoStandard::Pal);
+        pal.chroma_phase_error = 0.05;
+        let rows = flat_color_rows(&pal, ORANGE);
+        let with_delay_line = (row_hue(&rows, 15) - row_hue(&rows, 16)).abs();
+        pal.pal_delay_line = false;
+        let rows = flat_color_rows(&pal, ORANGE);
+        let without = (row_hue(&rows, 15) - row_hue(&rows, 16)).abs();
+        assert!(
+            with_delay_line < 0.05,
+            "neighboring rows differ by {with_delay_line} with the delay line"
+        );
+        assert!(
+            without > 0.2,
+            "neighboring rows differ by only {without} without the delay line"
         );
     }
 }

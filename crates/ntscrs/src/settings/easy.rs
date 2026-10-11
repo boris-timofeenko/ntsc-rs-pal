@@ -9,7 +9,7 @@ use super::{
         ChromaDemodulationFilter, ChromaLowpass, FbmNoiseSettings, FilterType,
         HeadSwitchingMidLineSettings, HeadSwitchingSettings, LumaLowpass, NtscEffect,
         RingingSettings, ScaleSettings, TrackingNoiseSettings, UseField, VHSEdgeWaveSettings,
-        VHSSettings, VHSSharpenSettings, VHSTapeSpeed,
+        VHSSettings, VHSSharpenSettings, VHSTapeSpeed, VideoStandard,
     },
 };
 
@@ -478,6 +478,8 @@ impl From<&EasyMode> for NtscEffect {
     fn from(easy_settings: &EasyMode) -> Self {
         Self {
             random_seed: easy_settings.random_seed,
+            video_standard: VideoStandard::Ntsc,
+            pal_delay_line: true,
             use_field: easy_settings.use_field,
             filter_type: easy_settings.filter_type,
             input_luma_filter: LumaLowpass::Notch,
